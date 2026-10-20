@@ -6,6 +6,9 @@ extern "C" int NitroSpMain(void *arg);
 #include <string>
 #include <vector>
 #include <simulator/community_scenario.h>
+#include <simulator/community_controller.h>
+#include <filesystem>
+#include <stdexcept>
 #include <pthread.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_events.h>
@@ -1002,6 +1005,9 @@ static void CommunityCaptureFrame()
 static void CommunityScenarioInput()
 {
 #if defined(SDK_BUILD_WIN64) || defined(SDK_BUILD_LINUX)
+  // The reactive controller owns these same emulated buttons exclusively.
+  const char *controller = getenv("PLATINUM_COMMUNITY_CONTROLLER");
+  if (controller && *controller) return;
   static bool initialized;
   static std::vector<SIM_CommunityScenarioRecord> records;
   static size_t next;
@@ -1031,6 +1037,79 @@ static void CommunityScenarioInput()
   s_reg_PAD_KEYINPUT = (s_reg_PAD_KEYINPUT & ~0x3ff) | ((~mask) & 0x3ff);
   *(vu16 *)HW_BUTTON_XY_BUF = (*(vu16 *)HW_BUTTON_XY_BUF & ~0xc00) | ((~mask) & 0xc00);
   ++frame;
+#endif
+}
+
+static void CommunityControllerInput()
+{
+#if defined(SDK_BUILD_WIN64) || defined(SDK_BUILD_LINUX)
+  static bool initialized, enabled;
+  static std::filesystem::path path, ack;
+  static SIM_CommunityControllerState state = {};
+  static unsigned previousMask;
+  if (!initialized) {
+    initialized = true;
+    const char *setting = getenv("PLATINUM_COMMUNITY_CONTROLLER");
+    if (!setting || !*setting) return;
+    const char *scenario = getenv("PLATINUM_COMMUNITY_SCENARIO");
+    try {
+      if (scenario && *scenario) throw std::runtime_error("scenario and controller cannot be enabled together");
+      const auto commandPath = std::filesystem::u8path(setting);
+      if (!commandPath.is_absolute() || !commandPath.has_filename()) throw std::runtime_error("controller requires an absolute command file");
+      path = commandPath;
+      if (const char *ackSetting = getenv("PLATINUM_COMMUNITY_CONTROLLER_ACK")) {
+        if (*ackSetting) {
+          const auto ackPath = std::filesystem::u8path(ackSetting);
+          if (!ackPath.is_absolute() || !ackPath.has_filename()
+              || std::filesystem::weakly_canonical(commandPath) == std::filesystem::weakly_canonical(ackPath)) throw std::runtime_error("ack requires a different absolute file");
+          std::error_code ec;
+          if (std::filesystem::equivalent(commandPath, ackPath, ec) && !ec) throw std::runtime_error("ack aliases the command file");
+          ack = ackPath;
+        }
+      }
+      enabled = true;
+      fprintf(stderr,"Community private reactive controller enabled; bounded emulated buttons only\n");
+      fflush(stderr);
+    } catch (const std::exception& error) {
+      fprintf(stderr,"Community controller refused: %s\n",error.what());
+      fflush(stderr);
+      exit(2);
+    }
+  }
+  if (!enabled) return;
+  bool accepted = false;
+  // Refuse pipes, devices, oversized files, and incomplete records. Read at
+  // most65 bytes even if a writer replaces the regular file after this check.
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(path, ec) && !ec && std::filesystem::file_size(path, ec) <= 64 && !ec) {
+#ifdef SDK_BUILD_WIN64
+    FILE *file = _wfopen(path.c_str(), L"rb");
+#else
+    FILE *file = fopen(path.c_str(), "rb");
+#endif
+    if (file) {
+      SIM_CommunityControllerRecord record;
+      if (SIM_CommunityController_Read(file, &record)) accepted = SIM_CommunityController_Accept(&state, &record) != 0;
+      fclose(file);
+    }
+  }
+  const unsigned mask = SIM_CommunityController_Frame(&state);
+  s_reg_PAD_KEYINPUT = (s_reg_PAD_KEYINPUT & ~0x3ff) | ((~mask) & 0x3ff);
+  *(vu16 *)HW_BUTTON_XY_BUF = (*(vu16 *)HW_BUTTON_XY_BUF & ~0xc00) | ((~mask) & 0xc00);
+  if (!ack.empty() && (accepted || previousMask != mask)) {
+    // Only this explicitly selected optional path is written. Acknowledgments
+    // describe held mask and remaining frames; release has mask/duration zero.
+#ifdef SDK_BUILD_WIN64
+    FILE *file = _wfopen(ack.c_str(), L"wb");
+#else
+    FILE *file = fopen(ack.c_str(), "wb");
+#endif
+    if (file) {
+      fprintf(file, "%u %03x %u\n", state.lastId, mask, state.remaining);
+      fclose(file);
+    }
+  }
+  previousMask = mask;
 #endif
 }
 
@@ -1341,6 +1420,7 @@ void *SIM_Render(void *arg) {
       }
     }
     CommunityScenarioInput();
+    CommunityControllerInput();
 
     SDL_GetMouseState(&x, &y);
 
