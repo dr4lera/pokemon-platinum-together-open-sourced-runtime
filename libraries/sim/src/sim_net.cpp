@@ -6,6 +6,7 @@
 #include <simulator/wmsp_indicate.h>
 #include <simulator/sim_net_validation.h>
 #include <cstddef>
+#include <atomic>
 
 extern "C" void WMSP_Wait4Wm9(void);
 
@@ -50,6 +51,27 @@ enum {
 };
 
 static SIM_Net_t net = {};
+static std::atomic<const SIM_Net_Provider_t*> applicationProvider{nullptr};
+
+BOOL SIM_Net_InstallProvider(const SIM_Net_Provider_t *provider)
+{
+    if (!provider || provider->version != 1 || !provider->process || !provider->beacon
+        || !provider->startHost || !provider->startClient || !provider->getAid
+        || !provider->getPlayerId || !provider->getState || !provider->getPlayerCount
+        || !provider->getPlayers || !provider->setGameInfo || !provider->setMPState
+        || !provider->join || !provider->disconnect || !provider->send || !provider->scan)
+        return FALSE;
+    const SIM_Net_Provider_t *expected = nullptr;
+    if (const auto *installed = applicationProvider.load(std::memory_order_acquire)) return installed == provider ? TRUE : FALSE;
+    if (net.state != SIM_NET_STATE_DISCONNECTED || net.enetHost != nullptr) return FALSE;
+    /* WM can advertise before a transport is selected. Preserve its current
+     * metadata/role when an application explicitly selects this provider. */
+    provider->setGameInfo(provider->context, net.curPlayer.ggid, net.curPlayer.tgid,
+        net.curPlayer.userGameInfo, net.curPlayer.userGameInfoLength);
+    provider->setMPState(provider->context, net.curPlayer.mpState);
+    return applicationProvider.compare_exchange_strong(expected, provider,
+        std::memory_order_release, std::memory_order_acquire) ? TRUE : FALSE;
+}
 
 static int NetThread(void * arg);
 
@@ -93,6 +115,7 @@ void SIM_Net_Init()
 
 void SIM_Net_Process()
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) { p->process(p->context); return; }
     if(net.enetHost == NULL || (net.state != SIM_NET_STATE_CLIENT && net.state != SIM_NET_STATE_HOST)) {
         return;
     }
@@ -116,6 +139,7 @@ void SIM_Net_Process()
 
 void SIM_Net_SendBeaconIndication()
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) { p->beacon(p->context); return; }
     // Send Beacon notification to WM
     if(net.curPlayer.mpState == SIM_NET_MPSTATE_PARENT) {
         WMSP_IndicateSendBeacon();
@@ -124,6 +148,7 @@ void SIM_Net_SendBeaconIndication()
 
 BOOL SIM_Net_StartHost()
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->startHost(p->context);
     if(net.state != SIM_NET_STATE_DISCONNECTED) {
         return FALSE;
     }
@@ -151,6 +176,7 @@ BOOL SIM_Net_StartHost()
 
 BOOL SIM_Net_StartClient(char * ipAddress)
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->startClient(p->context, ipAddress);
     if(net.state != SIM_NET_STATE_DISCONNECTED) {
         return FALSE;
     }
@@ -252,31 +278,37 @@ BOOL SIM_Net_StartClient(char * ipAddress)
 
 int SIM_Net_GetAID()
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->getAid(p->context);
     return net.curPlayer.aid;
 }
 
 int SIM_Net_GetCurrentPlayerID()
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->getPlayerId(p->context);
     return net.curPlayer.id;
 }
 
 SIM_Net_State_t SIM_Net_GetCurrentState()
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->getState(p->context);
     return net.state;
 }
 
 int SIM_Net_GetPlayerCount()
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->getPlayerCount(p->context);
     return net.playerCount;
 }
 
 const SIM_Net_Player_t * SIM_Net_GetPlayerList()
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->getPlayers(p->context);
     return net.playerList;
 }
 
 void SIM_Net_SetGameInfo(int ggid, int tgid, u8 * userGameInfo, int userGameInfoLength)
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) { p->setGameInfo(p->context, ggid, tgid, userGameInfo, userGameInfoLength); return; }
     if(userGameInfoLength < 0) return;
     net.curPlayer.ggid = ggid;
     net.curPlayer.tgid = tgid;
@@ -292,12 +324,14 @@ void SIM_Net_SetGameInfo(int ggid, int tgid, u8 * userGameInfo, int userGameInfo
 
 void SIM_Net_SetMPState(SIM_Net_MPState_t state)
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) { p->setMPState(p->context, state); return; }
     net.curPlayer.mpState = state;
     SendMyPlayer();
 }
 
 BOOL SIM_Net_JoinMP(u8 * bssid, u8 * ssid)
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->join(p->context, bssid, ssid);
     // Find the connected player with matching mac address (bssid)
     int idNo = -1;
     for(int i=0; i < SIM_NET_MAX_PLAYERS; i++) {
@@ -342,6 +376,7 @@ BOOL SIM_Net_JoinMP(u8 * bssid, u8 * ssid)
 
 BOOL SIM_Net_DisconnectMP(u16 aidBitmap, u16 * resultBitmap)
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->disconnect(p->context, aidBitmap, resultBitmap);
     BOOL result = FALSE;
     SIM_Net_DisconnectPacket_t disconnectPacket = {};
     InitPacketHeader(&disconnectPacket.common.header);
@@ -399,6 +434,7 @@ BOOL SIM_Net_DisconnectMP(u16 aidBitmap, u16 * resultBitmap)
 
 BOOL SIM_Net_SendMPData(u16 aidBitmap, u8 port, u8 * data, int dataLen)
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->send(p->context, aidBitmap, port, data, dataLen);
     if(!SIM_Net_ValidMPData(net.curPlayer.aid, port, dataLen,
                            dataLen < 0 ? 0 : (size_t)dataLen, WM_SIZE_MP_DATA_MAX)
        || (dataLen > 0 && !data)) return FALSE;
@@ -453,6 +489,7 @@ BOOL SIM_Net_SendMPData(u16 aidBitmap, u8 port, u8 * data, int dataLen)
 
 int SIM_Net_Scan(WMBssDesc * bssDescOut)
 {
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->scan(p->context, bssDescOut);
     int numParentsFound = 0;
 
     for(int i=0; i < SIM_NET_MAX_PLAYERS; i++) {
@@ -980,6 +1017,11 @@ static void ReceiveMPData(ENetEvent * event)
        || !sender || dataPacket->aid != sender->aid
        || !SIM_Net_ValidMPData(dataPacket->aid, dataPacket->port, dataPacket->dataLen,
                               event->packet->dataLength - sizeof(SIM_Net_MpDataPacket_t), WM_SIZE_MP_DATA_MAX)) return;
+    if(net.curPlayer.mpState == SIM_NET_MPSTATE_PARENT
+       && (sender->mpState != SIM_NET_MPSTATE_CHILD || sender->aid == 0
+           || !(net.aidBitmask & (1 << sender->aid)))) return;
+    if(net.curPlayer.mpState == SIM_NET_MPSTATE_CHILD
+       && (sender->mpState != SIM_NET_MPSTATE_PARENT || sender->aid != 0)) return;
 
     SIM_WMSP_Indicate_t indicate = {};
     indicate.cmd = SIM_NET_MPPACKETCMD_DATA;

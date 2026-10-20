@@ -4,6 +4,8 @@ extern "C" int NitroSpMain(void *arg);
 #define _POSIX_C_SOURCE 199309L
 
 #include <string>
+#include <vector>
+#include <simulator/community_scenario.h>
 #include <pthread.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_events.h>
@@ -941,6 +943,95 @@ static void HandleJoystickKeyUp(int aKey) {
   }
 }
 
+/* Explicit, one-shot capture of this application's own framebuffer. This is
+ * useful on desktops whose compositor cannot capture an OpenGL window. It
+ * never reads another window, injects input, or replaces an existing file. */
+static void CommunityCaptureFrame()
+{
+#if defined(SDK_BUILD_WIN64) || defined(SDK_BUILD_LINUX)
+  static unsigned frames;
+  static bool attempted;
+  const char *path = getenv("PLATINUM_COMMUNITY_CAPTURE");
+  unsigned after = 180;
+  if (const char *setting = getenv("PLATINUM_COMMUNITY_CAPTURE_FRAME")) {
+    char *end; errno = 0;
+    unsigned long value = strtoul(setting, &end, 10);
+    if (!errno && *setting >= '0' && *setting <= '9' && *end == '\0' && value >= 1 && value <= 36000) after = (unsigned)value;
+  }
+  if (attempted || path == NULL || *path == '\0' || ++frames < after) return;
+  attempted = true;
+  size_t length = strlen(path);
+  if (length < 4 || strcmp(path + length - 4, ".ppm") != 0) return;
+  int width, height;
+  SDL_GL_GetDrawableSize(window, &width, &height);
+  if (width < 1 || height < 1 || width > 4096 || height > 4096) return;
+  FILE *file = fopen(path, "wbx");
+  if (file == NULL) return;
+  std::vector<unsigned char> rgba((size_t)width * height * 4);
+  std::vector<unsigned char> row((size_t)width * 3);
+  GLint framebuffer, buffer, alignment, packBuffer;
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &framebuffer);
+  glGetIntegerv(GL_READ_BUFFER, &buffer);
+  glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+  glReadBuffer(GL_BACK);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+  glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, packBuffer);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+  glReadBuffer(buffer);
+  bool ok = fprintf(file, "P6\n%d %d\n255\n", width, height) > 0;
+  for (int y = height - 1; y >= 0 && ok; y--) {
+    for (int x = 0; x < width; x++) {
+      const unsigned char *pixel = rgba.data() + ((size_t)y * width + x) * 4;
+      memcpy(row.data() + (size_t)x * 3, pixel, 3);
+    }
+    ok = fwrite(row.data(), 1, row.size(), file) == row.size();
+  }
+  ok = fclose(file) == 0 && ok;
+  fprintf(stderr, "Community framebuffer capture %s: %dx%d\n", ok ? "written" : "failed", width, height);
+  fflush(stderr);
+#endif
+}
+
+static void CommunityScenarioInput()
+{
+#if defined(SDK_BUILD_WIN64) || defined(SDK_BUILD_LINUX)
+  static bool initialized;
+  static std::vector<SIM_CommunityScenarioRecord> records;
+  static size_t next;
+  static unsigned frame, mask;
+  if (!initialized) {
+    initialized = true;
+    const char *path = getenv("PLATINUM_COMMUNITY_SCENARIO");
+    if (path == NULL || *path == '\0') return;
+    if (path[0] != '/' && !(strlen(path) >= 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\'))) return;
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return;
+    char line[128]; bool valid = true;
+    while (fgets(line, sizeof(line), file)) {
+      SIM_CommunityScenarioRecord record;
+      if (records.size() >= 1024 || !SIM_CommunityScenario_Parse(line, &record)
+          || (!records.empty() && record.frame <= records.back().frame)) { valid = false; break; }
+      records.push_back(record);
+    }
+    valid = valid && !ferror(file) && !records.empty() && records.back().mask == 0;
+    fclose(file);
+    if (!valid) { records.clear(); return; }
+    fprintf(stderr, "Community private scenario loaded: %zu button records\n", records.size());
+    fflush(stderr);
+  }
+  if (records.empty() || next >= records.size()) return;
+  while (next < records.size() && records[next].frame <= frame) mask = records[next++].mask;
+  s_reg_PAD_KEYINPUT = (s_reg_PAD_KEYINPUT & ~0x3ff) | ((~mask) & 0x3ff);
+  *(vu16 *)HW_BUTTON_XY_BUF = (*(vu16 *)HW_BUTTON_XY_BUF & ~0xc00) | ((~mask) & 0xc00);
+  ++frame;
+#endif
+}
+
 void *SIM_Render(void *arg) {
 
   SDL_Event Event;
@@ -1247,7 +1338,7 @@ void *SIM_Render(void *arg) {
         s_tpData.touch = 0;
       }
     }
-    s_reg_PAD_KEYINPUT = s_reg_PAD_KEYINPUT;
+    CommunityScenarioInput();
 
     SDL_GetMouseState(&x, &y);
 
@@ -1325,6 +1416,7 @@ void *SIM_Render(void *arg) {
       }
     }
 
+    CommunityCaptureFrame();
     SDL_GL_SwapWindow(window);
 
     if(sChangeInternalResAfterRender) {

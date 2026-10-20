@@ -541,7 +541,17 @@ void WMSP_StartConnectEx(OSMessage msg)
         (void)WMSP_ReturnResult2Wm9((void *)callback);
     }
 
-    SIM_Net_JoinMP(args->pInfo->bssid, args->ssid);
+    if (!SIM_Net_JoinMP(args->pInfo->bssid, args->ssid))
+    {
+        WMStartConnectCallback *callback =
+            (WMStartConnectCallback *)WMSP_GetBuffer4Callback2Wm9();
+        callback->apiid = WM_APIID_START_CONNECT;
+        callback->errcode = WM_ERRCODE_FAILED;
+        callback->state = WM_STATECODE_DISCONNECTED;
+        callback->aid = 0;
+        WMSP_ReturnResult2Wm9(callback);
+        return;
+    }
 
     status->aid = SIM_Net_GetAID();
     status->child_bitmap = 0x0001;

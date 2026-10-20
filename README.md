@@ -14,7 +14,20 @@ The gameplay client's `tests/run_community_wireless.py` also checks bounds and
 established-peer identity binding in the legacy LAN parser, receive-buffer
 lifetime through WM callback acknowledgment, packet cleanup and actual WM send
 failure status. This LAN path does not authenticate community accounts. The
-authenticated party/link transport and its lifecycle are separate ongoing work.
+authenticated party/link transport is selected explicitly by the application
+through the permanent `SIM_Net_Provider_t` table. The table routes semantic WM
+operations; it does not expose or forward native ENet packet layouts. A failed
+join now reports a failed ARM7 connect callback instead of claiming success.
+Application-level integration and gameplay checks remain the client's scope.
+
+Desktop QA can explicitly set `PLATINUM_COMMUNITY_CAPTURE` to a fresh `.ppm`
+path. A one-shot capture reads only this application's OpenGL backbuffer after
+180 frames (or `PLATINUM_COMMUNITY_CAPTURE_FRAME`, 1–36000). It never replaces an
+existing file. `PLATINUM_COMMUNITY_SCENARIO` may select an absolute, private text
+file containing at most 1024 ordered `decimal-frame hex-button-mask` records.
+Frames are bounded to 36000, masks to the twelve emulated buttons, and the final
+mask must release all buttons. This opt-in fixture drives only emulated inputs
+inside this process; it never focuses a window or injects OS keyboard/mouse input.
 
 ![logo](images/libntr.png)
 Drop-in replacement for NitroSDK that targets Nintendo DS/DSi, PC, and other platforms.

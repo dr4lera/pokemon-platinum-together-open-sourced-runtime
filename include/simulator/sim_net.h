@@ -145,11 +145,37 @@ typedef struct {
     u8 data[];
 } SIM_Net_MpDataPacket_t;
 
+/* An explicitly selected application transport implements WM operations rather
+ * than forwarding the simulator's compiler-dependent ENet packet structs.
+ * The table and context must live until process exit. Installation is one-way
+ * and must precede any ENet connection; callbacks may run on the net/ARM7/game
+ * threads and must synchronize their own state. process() owns RX lifetimes. */
+typedef struct {
+    unsigned version; /* Must be 1. */
+    void *context;
+    void (*process)(void *);
+    void (*beacon)(void *);
+    BOOL (*startHost)(void *);
+    BOOL (*startClient)(void *, const char *);
+    int (*getAid)(void *);
+    int (*getPlayerId)(void *);
+    SIM_Net_State_t (*getState)(void *);
+    int (*getPlayerCount)(void *);
+    const SIM_Net_Player_t *(*getPlayers)(void *);
+    void (*setGameInfo)(void *, int, int, const u8 *, int);
+    void (*setMPState)(void *, SIM_Net_MPState_t);
+    BOOL (*join)(void *, const u8 *, const u8 *);
+    BOOL (*disconnect)(void *, u16, u16 *);
+    BOOL (*send)(void *, u16, u8, const u8 *, int);
+    int (*scan)(void *, WMBssDesc *);
+} SIM_Net_Provider_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 void SIM_Net_Init();
+BOOL SIM_Net_InstallProvider(const SIM_Net_Provider_t *provider);
 void SIM_Net_Process();
 void SIM_Net_SendBeaconIndication();
 void SIM_Net_StartThread();
