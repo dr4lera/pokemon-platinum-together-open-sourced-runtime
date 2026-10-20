@@ -4,6 +4,18 @@
 #include <simulator/config/sim_config.h>
 #include <simulator/sim_net.h>
 #include <simulator/wmsp_indicate.h>
+#include <simulator/sim_net_validation.h>
+#include <cstddef>
+
+extern "C" void WMSP_Wait4Wm9(void);
+
+/* A WM receive callback borrows the ENet payload until its ARM9 FIFO callback
+ * finishes. ReceiveMPData waits for that acknowledgement before this guard
+ * releases the packet. Malformed/unhandled packets use the same release path. */
+struct ReceivedPacket {
+    ENetPacket* packet;
+    ~ReceivedPacket() { if(packet) enet_packet_destroy(packet); }
+};
 
 #ifdef __WIN32__
     #include <winsock2.h>
@@ -55,6 +67,15 @@ static void ProcessMPChildEvent(ENetEvent * event);
 
 static void ReceiveMPData(ENetEvent * event);
 
+static SIM_Net_Player_t* EstablishedPlayer(ENetPeer* peer)
+{
+    if(!peer) return nullptr;
+    for(int i=0; i<SIM_NET_MAX_PLAYERS; ++i) {
+        if(net.peerList[i] == peer && peer->data == &net.playerList[i]) return &net.playerList[i];
+    }
+    return nullptr;
+}
+
 static void HostUpdatePlayerList();
 
 void SIM_Net_Init()
@@ -72,12 +93,13 @@ void SIM_Net_Init()
 
 void SIM_Net_Process()
 {
-    if(net.enetHost == NULL) {
+    if(net.enetHost == NULL || (net.state != SIM_NET_STATE_CLIENT && net.state != SIM_NET_STATE_HOST)) {
         return;
     }
     
     ENetEvent event;
     while(enet_host_service(net.enetHost, &event, 0) > 0) {
+        ReceivedPacket received{event.type == ENET_EVENT_TYPE_RECEIVE ? event.packet : nullptr};
         #ifdef SDK_TRACY_ENABLE
         TracyCZone(ctx, 1);
         #endif
@@ -166,6 +188,7 @@ BOOL SIM_Net_StartClient(char * ipAddress)
             break;
         }
         if(enet_host_service(net.enetHost, &event, 10) > 0) {
+            ReceivedPacket received{event.type == ENET_EVENT_TYPE_RECEIVE ? event.packet : nullptr};
             if (connStatus == 0 && event.type == ENET_EVENT_TYPE_CONNECT)
             {
                 connStatus = 1;
@@ -187,6 +210,10 @@ BOOL SIM_Net_StartClient(char * ipAddress)
                     continue;
                 }
 
+                if(!SIM_Net_ValidPlayerId(packetData->playerId) || packetData->playerId == 0) {
+                    continue;
+                }
+
                 net.curPlayer.id = packetData->playerId;
 
                 //Send player information to the host
@@ -195,7 +222,11 @@ BOOL SIM_Net_StartClient(char * ipAddress)
                 playerInfoPacket.common.cmd = SIM_NET_MGMTPACKETCMD_PLAYER_INFO;
                 memcpy(&playerInfoPacket.player, &net.curPlayer, sizeof(SIM_Net_Player_t));
                 ENetPacket * pkt = enet_packet_create(&playerInfoPacket, sizeof(SIM_Net_PlayerInfoPacket_t), ENET_PACKET_FLAG_RELIABLE);
-                enet_peer_send(event.peer, SIM_NET_CHANNEL_MGMT, pkt);
+                if(!pkt) break;
+                if(enet_peer_send(event.peer, SIM_NET_CHANNEL_MGMT, pkt) != 0) {
+                    enet_packet_destroy(pkt);
+                    break;
+                }
 
                 connStatus = 2;
                 break;
@@ -246,6 +277,7 @@ const SIM_Net_Player_t * SIM_Net_GetPlayerList()
 
 void SIM_Net_SetGameInfo(int ggid, int tgid, u8 * userGameInfo, int userGameInfoLength)
 {
+    if(userGameInfoLength < 0) return;
     net.curPlayer.ggid = ggid;
     net.curPlayer.tgid = tgid;
     if(userGameInfo) {
@@ -291,10 +323,11 @@ BOOL SIM_Net_JoinMP(u8 * bssid, u8 * ssid)
     memcpy(myJoinRequest.ssid, ssid, WM_SIZE_CHILD_SSID);
 
     ENetPacket * pkt = enet_packet_create(&myJoinRequest, sizeof(SIM_Net_JoinReqPacket_t), ENET_PACKET_FLAG_RELIABLE);
-    if(!net.peerList[idNo]) {
+    if(!pkt) return FALSE;
+    if(!net.peerList[idNo] || enet_peer_send(net.peerList[idNo], SIM_NET_CHANNEL_APPDATA, pkt) != 0) {
+        enet_packet_destroy(pkt);
         return FALSE;
     }
-    enet_peer_send(net.peerList[idNo], SIM_NET_CHANNEL_APPDATA, pkt);
 
     //Wait for Join Response
     if(SDL_SemWaitTimeout(net.joinReqSemaphore, 5000) != 0) {
@@ -316,6 +349,7 @@ BOOL SIM_Net_DisconnectMP(u16 aidBitmap, u16 * resultBitmap)
     disconnectPacket.sendingAid = net.curPlayer.aid;
 
     ENetPacket * pkt = enet_packet_create(&disconnectPacket, sizeof(SIM_Net_DisconnectPacket_t), ENET_PACKET_FLAG_RELIABLE);
+    if(!pkt) return FALSE;
     
     for(int i=0; i < SIM_NET_MAX_PLAYERS; i++ ) {
         if(!(net.playerList[i].status == SIM_NET_PLAYERSTATUS_CLIENT || net.playerList[i].status == SIM_NET_PLAYERSTATUS_HOST)) {
@@ -327,7 +361,7 @@ BOOL SIM_Net_DisconnectMP(u16 aidBitmap, u16 * resultBitmap)
             continue;
         }
 
-        if(!((1 << net.playerList[i].aid) & aidBitmap)) {
+        if(net.playerList[i].aid >= 16 || !((1 << net.playerList[i].aid) & aidBitmap)) {
             // Not target AID
             continue;
         }
@@ -337,8 +371,8 @@ BOOL SIM_Net_DisconnectMP(u16 aidBitmap, u16 * resultBitmap)
             continue;
         }
 
+        if(enet_peer_send(net.peerList[i], SIM_NET_CHANNEL_APPDATA, pkt) != 0) continue;
         result = TRUE;
-        enet_peer_send(net.peerList[i], SIM_NET_CHANNEL_APPDATA, pkt);
         if(resultBitmap) {
             *resultBitmap = *resultBitmap | (1 << net.playerList[i].aid);
         }
@@ -348,6 +382,8 @@ BOOL SIM_Net_DisconnectMP(u16 aidBitmap, u16 * resultBitmap)
             net.aidBitmask &= ~(1 << net.playerList[i].aid);
         }
     }
+
+    if(!result) enet_packet_destroy(pkt);
 
     //TODO: Do we need to reset the AID and MP state here? or does a different API do that?
     if(result) {
@@ -363,16 +399,21 @@ BOOL SIM_Net_DisconnectMP(u16 aidBitmap, u16 * resultBitmap)
 
 BOOL SIM_Net_SendMPData(u16 aidBitmap, u8 port, u8 * data, int dataLen)
 {
+    if(!SIM_Net_ValidMPData(net.curPlayer.aid, port, dataLen,
+                           dataLen < 0 ? 0 : (size_t)dataLen, WM_SIZE_MP_DATA_MAX)
+       || (dataLen > 0 && !data)) return FALSE;
     int mpDataPacketSize = dataLen + sizeof(SIM_Net_MpDataPacket_t);
     SIM_Net_MpDataPacket_t * mpDataPacket = (SIM_Net_MpDataPacket_t *)malloc(mpDataPacketSize);
+    if(!mpDataPacket) return FALSE;
     memset(mpDataPacket, 0, mpDataPacketSize);
     InitPacketHeader(&mpDataPacket->common.header);
     mpDataPacket->common.cmd = SIM_NET_MPPACKETCMD_DATA;
     mpDataPacket->port = port;
     mpDataPacket->dataLen = dataLen;
     mpDataPacket->aid = net.curPlayer.aid;
-    memcpy(mpDataPacket->data, data, dataLen);
+    if(dataLen) memcpy(mpDataPacket->data, data, dataLen);
     ENetPacket * pkt = enet_packet_create(mpDataPacket, mpDataPacketSize, ENET_PACKET_FLAG_RELIABLE);
+    if(!pkt) { free(mpDataPacket); return FALSE; }
 
     printf("[SEND] ");
     for(int i=0; i < dataLen; i++) {
@@ -392,7 +433,7 @@ BOOL SIM_Net_SendMPData(u16 aidBitmap, u8 port, u8 * data, int dataLen)
             continue;
         }
 
-        if(!((1 << net.playerList[i].aid) & aidBitmap)) {
+        if(net.playerList[i].aid >= 16 || !((1 << net.playerList[i].aid) & aidBitmap)) {
             // Not target AID
             continue;
         }
@@ -402,13 +443,12 @@ BOOL SIM_Net_SendMPData(u16 aidBitmap, u8 port, u8 * data, int dataLen)
             continue;
         }
 
-        enet_peer_send(net.peerList[i], SIM_NET_CHANNEL_APPDATA, pkt);
-        numSent++;
+        if(enet_peer_send(net.peerList[i], SIM_NET_CHANNEL_APPDATA, pkt) == 0) numSent++;
     }
 
     free(mpDataPacket);
-    //return (numSent > 0);
-    return TRUE;
+    if(numSent == 0) enet_packet_destroy(pkt);
+    return numSent > 0;
 }
 
 int SIM_Net_Scan(WMBssDesc * bssDescOut)
@@ -479,6 +519,7 @@ static void SendMyPlayer()
         playerInfoPacket.common.cmd = SIM_NET_MGMTPACKETCMD_PLAYER_INFO;
         memcpy(&playerInfoPacket.player, &net.curPlayer, sizeof(SIM_Net_Player_t));
         ENetPacket * pkt = enet_packet_create(&playerInfoPacket, sizeof(SIM_Net_PlayerInfoPacket_t), ENET_PACKET_FLAG_RELIABLE);
+        if(!pkt) return;
         int peerNo = -1;
         for(int i=0; i < SIM_NET_MAX_PLAYERS; i++) {
             if(net.playerList[i].status == SIM_NET_PLAYERSTATUS_HOST && net.peerList[i] != NULL) {
@@ -487,9 +528,10 @@ static void SendMyPlayer()
             }
         }
         if(peerNo >= 0) {
-            enet_peer_send(net.peerList[peerNo], SIM_NET_CHANNEL_MGMT, pkt);
+            if(enet_peer_send(net.peerList[peerNo], SIM_NET_CHANNEL_MGMT, pkt) != 0) enet_packet_destroy(pkt);
         } else {
             printf("Error sending player info: Could not find host!\n");
+            enet_packet_destroy(pkt);
         }
     } else if(net.state == SIM_NET_STATE_HOST) {
         SDL_LockMutex(net.playerListMutex);
@@ -510,7 +552,7 @@ static BOOL CheckPacketHeader(SIM_Net_PacketHeader_t * header)
     if(htonl(header->magicNum) != SIM_NET_MAGIC_NUM) {
         return FALSE;
     }
-    if(htonl(header->protocolVer != 0)) {
+    if(ntohl(header->protocolVer) != SIM_NET_PROTOCOL_VER) {
         return FALSE;
     }
     return TRUE;
@@ -541,7 +583,12 @@ static void ProcessHostEvent(ENetEvent * event)
 
 
                     ENetPacket * myPacket = enet_packet_create(&clientInitPacket, sizeof(SIM_Net_ClientInitPacket_t), ENET_PACKET_FLAG_RELIABLE);
-                    enet_peer_send(event->peer, SIM_NET_CHANNEL_MGMT, myPacket);
+                    if(!myPacket) { enet_peer_disconnect(event->peer, 0); break; }
+                    if(enet_peer_send(event->peer, SIM_NET_CHANNEL_MGMT, myPacket) != 0) {
+                        enet_packet_destroy(myPacket);
+                        enet_peer_disconnect(event->peer, 0);
+                        break;
+                    }
 
                     SDL_LockMutex(net.playerListMutex);
 
@@ -595,8 +642,7 @@ static void ProcessHostEvent(ENetEvent * event)
                     SIM_Net_MgmtPacketCommon_t * packetCommon = (SIM_Net_MgmtPacketCommon_t *)event->packet->data;
                     switch(packetCommon->cmd) {
                         case SIM_NET_MGMTPACKETCMD_CLIENT_INIT:
-                            // I dont think the host should receive this one.
-                            SIM_assert_always();
+                            // A peer cannot reinitialize the host's node identity.
                             break;
                         case SIM_NET_MGMTPACKETCMD_PLAYER_INFO:
                             // Client sent us player info
@@ -608,14 +654,18 @@ static void ProcessHostEvent(ENetEvent * event)
 
                                 int idNo = playerInfoPkt->player.id;
 
-                                if(idNo > SIM_NET_MAX_PLAYERS) {
-                                    SIM_assert_always();
-                                }
+                                if(!SIM_Net_ValidPlayerId(idNo) || net.peerList[idNo] != event->peer
+                                   || event->peer->data != &net.playerList[idNo]
+                                   || playerInfoPkt->player.userGameInfoLength > 112
+                                   || playerInfoPkt->player.aid >= 16
+                                   || playerInfoPkt->player.mpState < SIM_NET_MPSTATE_OFF
+                                   || playerInfoPkt->player.mpState >= SIM_NET_MPSTATE_COUNT) break;
 
                                 SDL_LockMutex(net.playerListMutex);
 
                                 SIM_Net_Player_t *  thePlayer = &net.playerList[idNo];
                                 memcpy(thePlayer, &playerInfoPkt->player, sizeof(SIM_Net_Player_t));
+                                thePlayer->userName[SIM_NET_USERNAME_LEN] = '\0';
                                 thePlayer->status = SIM_NET_PLAYERSTATUS_CLIENT;
                                 thePlayer->ipAddr = event->peer->address.host;
 
@@ -712,15 +762,28 @@ static void ProcessClientEvent(ENetEvent * event)
                     switch(packetCommon->cmd) {
                         case SIM_NET_MGMTPACKETCMD_PLAYER_LIST:
                             {
-                                if(event->packet->dataLength < sizeof(SIM_Net_PlayerListPacket_t)) {
+                                if(event->peer != net.peerList[0]
+                                   || event->packet->dataLength < sizeof(SIM_Net_PlayerListPacket_t)) {
                                     break;
                                 }
                                 SIM_Net_PlayerListPacket_t * playerListPkt = (SIM_Net_PlayerListPacket_t*)event->packet->data;
 
+                                if(playerListPkt->numPlayers > SIM_NET_MAX_PLAYERS) break;
+                                bool valid = true;
+                                for(int i=0; i < SIM_NET_MAX_PLAYERS; i++) {
+                                    const auto& player = playerListPkt->playerList[i];
+                                    if(!SIM_Net_ValidPlayerId(player.id) || player.aid >= 16
+                                       || player.userGameInfoLength > 112
+                                       || player.status < SIM_NET_PLAYERSTATUS_NONE || player.status >= SIM_NET_PLAYERSTATUS_COUNT
+                                       || player.mpState < SIM_NET_MPSTATE_OFF || player.mpState >= SIM_NET_MPSTATE_COUNT) valid = false;
+                                }
+                                if(!valid) break;
+
                                 net.playerCount = playerListPkt->numPlayers;
                                 for(int i=0; i < SIM_NET_MAX_PLAYERS; i++) {
                                     memcpy(&net.playerList[i], &playerListPkt->playerList[i], sizeof(SIM_Net_Player_t));
-                                    net.playerList[i].id = htonl(playerListPkt->playerList[i].id);
+                                    net.playerList[i].id = i;
+                                    net.playerList[i].userName[SIM_NET_USERNAME_LEN] = '\0';
                                     //memcpy(net.playerList[i].userName, playerListPkt->playerList[i].userName, 10);
                                     //memcpy(net.playerList[i].ndsMacAddr, playerListPkt->playerList[i].ndsMacAddr, 6);
                                     //net.playerList[i]
@@ -755,7 +818,8 @@ static void ProcessClientEvent(ENetEvent * event)
 
 static void ProcessMPParentEvent(ENetEvent * event)
 {
-    if(event->packet->dataLength < sizeof(SIM_Net_MpPacketCommon_t)) {
+    SIM_Net_Player_t* sender = EstablishedPlayer(event->peer);
+    if(!sender || event->packet->dataLength < sizeof(SIM_Net_MpPacketCommon_t)) {
         return;
     }
 
@@ -764,9 +828,14 @@ static void ProcessMPParentEvent(ENetEvent * event)
     switch(mpPacketBase->cmd) {
         case SIM_NET_MPPACKETCMD_JOIN_REQ:
             {
-                // Determine the AID
-                int aid = -1;
-                for(int i=1; i < 16; i++) {
+                if(event->packet->dataLength != sizeof(SIM_Net_JoinReqPacket_t)) break;
+                auto* request = (SIM_Net_JoinReqPacket_t*)mpPacketBase;
+                if(request->playerId != sender->id) break;
+                // A retransmitted join must retain the child's allocated AID.
+                bool alreadyJoined = sender->mpState == SIM_NET_MPSTATE_CHILD
+                    && sender->aid > 0 && sender->aid < 16 && (net.aidBitmask & (1 << sender->aid));
+                int aid = alreadyJoined ? sender->aid : -1;
+                for(int i=1; !alreadyJoined && i < 16; i++) {
                     if(((net.aidBitmask >> i) & 1) == 0) {
                         aid = i;
                         net.aidBitmask = net.aidBitmask | (1 << aid);
@@ -787,7 +856,11 @@ static void ProcessMPParentEvent(ENetEvent * event)
                 printf("NET: Received join request. Assigning AID %d.\n", aid);
 
                 ENetPacket * pkt = enet_packet_create(&joinResponse, sizeof(SIM_Net_JoinRespPacket_t), ENET_PACKET_FLAG_RELIABLE);
-                enet_peer_send(event->peer, SIM_NET_CHANNEL_APPDATA, pkt);
+                if(!pkt || enet_peer_send(event->peer, SIM_NET_CHANNEL_APPDATA, pkt) != 0) {
+                    if(pkt) enet_packet_destroy(pkt);
+                    if(!alreadyJoined) net.aidBitmask &= ~(1 << aid);
+                    break;
+                }
 
                 if(event->peer->data != NULL) {
                     SDL_LockMutex(net.playerListMutex);
@@ -798,6 +871,8 @@ static void ProcessMPParentEvent(ENetEvent * event)
 
                     SDL_UnlockMutex(net.playerListMutex);
                 }
+
+                if(alreadyJoined) break;
                 
                 SIM_WMSP_Indicate_t indicate = {};
                 indicate.cmd = SIM_NET_MPPACKETCMD_JOIN_REQ;
@@ -807,15 +882,18 @@ static void ProcessMPParentEvent(ENetEvent * event)
                 indicate.data = joinReq->ssid;
                 
                 WMSP_Indicate(&indicate);
+                WMSP_Wait4Wm9();
             }
             break;
         case SIM_NET_MPPACKETCMD_JOIN_RESP:
-            SIM_assert_always_msg("Parent device should not receive a join response");
             break;
         case SIM_NET_MPPACKETCMD_DISCONNECT:
             // Child device is disconnecting
             {
+                if(event->packet->dataLength != sizeof(SIM_Net_DisconnectPacket_t)) break;
                 SIM_Net_DisconnectPacket_t * disconnectPacket = (SIM_Net_DisconnectPacket_t*)mpPacketBase;
+                if(disconnectPacket->sendingAid == 0 || disconnectPacket->sendingAid >= 16
+                   || disconnectPacket->sendingAid != sender->aid) break;
                 net.aidBitmask &= ~(1 << disconnectPacket->sendingAid);
 
                 printf("NET: Parent received disconnect from AID %d", disconnectPacket->sendingAid);
@@ -825,20 +903,22 @@ static void ProcessMPParentEvent(ENetEvent * event)
                 indicate.aid = disconnectPacket->sendingAid;
 
                 WMSP_Indicate(&indicate);
+                WMSP_Wait4Wm9();
             }
             break;
         case SIM_NET_MPPACKETCMD_DATA:
             ReceiveMPData(event);
             break;
         default:
-            SIM_assert_always_msg("Unknown MP Packet received.");
             break;
     }
 }
 
 static void ProcessMPChildEvent(ENetEvent * event)
 {
-    if(event->packet->dataLength < sizeof(SIM_Net_MpPacketCommon_t)) {
+    SIM_Net_Player_t* sender = EstablishedPlayer(event->peer);
+    if(!sender || sender->mpState != SIM_NET_MPSTATE_PARENT
+       || event->packet->dataLength < sizeof(SIM_Net_MpPacketCommon_t)) {
         return;
     }
 
@@ -850,24 +930,27 @@ static void ProcessMPChildEvent(ENetEvent * event)
             break;
         case SIM_NET_MPPACKETCMD_JOIN_RESP:
             {
+                if(event->packet->dataLength != sizeof(SIM_Net_JoinRespPacket_t)) break;
                 SIM_Net_JoinRespPacket_t * joinRespPacket = (SIM_Net_JoinRespPacket_t*)event->packet->data;
+                if(joinRespPacket->aid == 0 || joinRespPacket->aid >= 16) break;
                 printf("NET: Received join response. AID %d.\n", joinRespPacket->aid);
-                SDL_SemPost(net.joinReqSemaphore);
                 net.curPlayer.aid = joinRespPacket->aid;
                 net.curPlayer.mpState = SIM_NET_MPSTATE_CHILD;
                 SendMyPlayer();
+                SDL_SemPost(net.joinReqSemaphore);
                 break;
             }
         case SIM_NET_MPPACKETCMD_DISCONNECT:
             // Parent is kicking this child out of the group
             {
+                if(event->packet->dataLength != sizeof(SIM_Net_DisconnectPacket_t)) break;
                 SIM_Net_DisconnectPacket_t * disconnectPacket = (SIM_Net_DisconnectPacket_t*)mpPacketBase;
 
-                SIM_assert(disconnectPacket->sendingAid == 0);
+                if(disconnectPacket->sendingAid != 0) break;
                 printf("NET: Child received disconnect. Setting MP state to OFF.\n");
 
                 net.curPlayer.aid = 0;
-                net.curPlayer.mpState == SIM_NET_MPSTATE_OFF;
+                net.curPlayer.mpState = SIM_NET_MPSTATE_OFF;
                 SendMyPlayer();
 
                 SIM_WMSP_Indicate_t indicate = {};
@@ -875,6 +958,7 @@ static void ProcessMPChildEvent(ENetEvent * event)
                 indicate.aid = 0;
 
                 WMSP_Indicate(&indicate);
+                WMSP_Wait4Wm9();
             }
             break;
 
@@ -883,14 +967,19 @@ static void ProcessMPChildEvent(ENetEvent * event)
             break;
         
         default:
-            SIM_assert_always_msg("Unknown MP Packet received");
             break;
     }
 }
 
 static void ReceiveMPData(ENetEvent * event)
 {
+    if(event->packet->dataLength < sizeof(SIM_Net_MpDataPacket_t)) return;
     SIM_Net_MpDataPacket_t * dataPacket = (SIM_Net_MpDataPacket_t *)event->packet->data;
+    SIM_Net_Player_t* sender = EstablishedPlayer(event->peer);
+    if((net.curPlayer.mpState != SIM_NET_MPSTATE_PARENT && net.curPlayer.mpState != SIM_NET_MPSTATE_CHILD)
+       || !sender || dataPacket->aid != sender->aid
+       || !SIM_Net_ValidMPData(dataPacket->aid, dataPacket->port, dataPacket->dataLen,
+                              event->packet->dataLength - sizeof(SIM_Net_MpDataPacket_t), WM_SIZE_MP_DATA_MAX)) return;
 
     SIM_WMSP_Indicate_t indicate = {};
     indicate.cmd = SIM_NET_MPPACKETCMD_DATA;
@@ -905,6 +994,7 @@ static void ReceiveMPData(ENetEvent * event)
     printf("\n");
 
     WMSP_Indicate(&indicate);
+    WMSP_Wait4Wm9();
 }
 
 
@@ -917,5 +1007,5 @@ static void HostUpdatePlayerList()
     playerListPkt.numPlayers = net.playerCount;
     memcpy(playerListPkt.playerList, net.playerList, sizeof(playerListPkt.playerList));
     ENetPacket * pkt = enet_packet_create(&playerListPkt, sizeof(SIM_Net_PlayerListPacket_t), ENET_PACKET_FLAG_RELIABLE);
-    enet_host_broadcast(net.enetHost, SIM_NET_CHANNEL_MGMT, pkt);
+    if(pkt) enet_host_broadcast(net.enetHost, SIM_NET_CHANNEL_MGMT, pkt);
 }

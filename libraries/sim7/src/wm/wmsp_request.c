@@ -691,6 +691,7 @@ void WMSP_SetMPData(OSMessage msg)
             BOOL sendResult = SIM_Net_SendMPData(destBitmap, port, (u8*)sendData, sendSize);
             if (!sendResult) {
                 printf("SIM_Net_SendMPData failed!\n");
+                result = WM_ERRCODE_SEND_FAILED;
             } else {
                 result = WM_ERRCODE_SUCCESS;
             }

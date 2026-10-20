@@ -10,6 +10,11 @@ asset root and a restricted patch overlay; no game assets are included.
 The gameplay client's `tests/run_community_asset_overlay.py` checks the actual
 resolver and FS opener, including patch preference, fallback, malformed paths
 and symlink confinement. These checks do not establish full gameplay parity.
+The gameplay client's `tests/run_community_wireless.py` also checks bounds and
+established-peer identity binding in the legacy LAN parser, receive-buffer
+lifetime through WM callback acknowledgment, packet cleanup and actual WM send
+failure status. This LAN path does not authenticate community accounts. The
+authenticated party/link transport and its lifecycle are separate ongoing work.
 
 ![logo](images/libntr.png)
 Drop-in replacement for NitroSDK that targets Nintendo DS/DSi, PC, and other platforms.
