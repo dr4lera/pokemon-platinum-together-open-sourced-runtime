@@ -951,26 +951,18 @@ static void HandleJoystickKeyUp(int aKey) {
 /* Explicit, one-shot capture of this application's own framebuffer. This is
  * useful on desktops whose compositor cannot capture an OpenGL window. It
  * never reads another window, injects input, or replaces an existing file. */
-static void CommunityCaptureFrame()
+static void CommunityCaptureWrite(const std::filesystem::path& path)
 {
 #if defined(SDK_BUILD_WIN64) || defined(SDK_BUILD_LINUX)
-  static unsigned frames;
-  static bool attempted;
-  const char *path = getenv("PLATINUM_COMMUNITY_CAPTURE");
-  unsigned after = 180;
-  if (const char *setting = getenv("PLATINUM_COMMUNITY_CAPTURE_FRAME")) {
-    char *end; errno = 0;
-    unsigned long value = strtoul(setting, &end, 10);
-    if (!errno && *setting >= '0' && *setting <= '9' && *end == '\0' && value >= 1 && value <= 36000) after = (unsigned)value;
-  }
-  if (attempted || path == NULL || *path == '\0' || ++frames < after) return;
-  attempted = true;
-  size_t length = strlen(path);
-  if (length < 4 || strcmp(path + length - 4, ".ppm") != 0) return;
+  if (path.extension() != ".ppm") return;
   int width, height;
   SDL_GL_GetDrawableSize(window, &width, &height);
   if (width < 1 || height < 1 || width > 4096 || height > 4096) return;
-  FILE *file = fopen(path, "wbx");
+#ifdef SDK_BUILD_WIN64
+  FILE *file = _wfopen(path.c_str(), L"wbx");
+#else
+  FILE *file = fopen(path.c_str(), "wbx");
+#endif
   if (file == NULL) return;
   std::vector<unsigned char> rgba((size_t)width * height * 4);
   std::vector<unsigned char> row((size_t)width * 3);
@@ -999,6 +991,54 @@ static void CommunityCaptureFrame()
   ok = fclose(file) == 0 && ok;
   fprintf(stderr, "Community framebuffer capture %s: %dx%d\n", ok ? "written" : "failed", width, height);
   fflush(stderr);
+#endif
+}
+
+static void CommunityCaptureFrame()
+{
+#if defined(SDK_BUILD_WIN64) || defined(SDK_BUILD_LINUX)
+  static unsigned frames, lastRequest;
+  static bool attempted;
+  const char *path = getenv("PLATINUM_COMMUNITY_CAPTURE");
+  const char *request = getenv("PLATINUM_COMMUNITY_CAPTURE_REQUEST");
+  if (request && *request) {
+    // Request mode exclusively selects captures; the fixed-frame path below
+    // remains unchanged when this explicit request file is not configured.
+    try {
+      const auto requestPath = std::filesystem::u8path(request);
+      const auto base = path ? std::filesystem::u8path(path) : std::filesystem::path{};
+      if (!requestPath.is_absolute() || !requestPath.has_filename() || !base.is_absolute() || !base.has_filename()) throw std::runtime_error("capture request and output base must be absolute file paths");
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(requestPath, ec) || ec || std::filesystem::file_size(requestPath, ec) > 16 || ec) return;
+#ifdef SDK_BUILD_WIN64
+      FILE *file = _wfopen(requestPath.c_str(), L"rb");
+#else
+      FILE *file = fopen(requestPath.c_str(), "rb");
+#endif
+      if (!file) return;
+      unsigned id;
+      const bool valid = SIM_CommunityCapture_Read(file, &id) != 0;
+      fclose(file);
+      if (!valid || !SIM_CommunityCapture_Accept(&lastRequest, id)) return;
+      auto output = base;
+      output += "." + std::to_string(id) + ".ppm";
+      CommunityCaptureWrite(output);
+    } catch (const std::exception& error) {
+      fprintf(stderr,"Community capture request refused: %s\n",error.what());
+      fflush(stderr);
+      exit(2);
+    }
+    return;
+  }
+  unsigned after = 180;
+  if (const char *setting = getenv("PLATINUM_COMMUNITY_CAPTURE_FRAME")) {
+    char *end; errno = 0;
+    unsigned long value = strtoul(setting, &end, 10);
+    if (!errno && *setting >= '0' && *setting <= '9' && *end == '\0' && value >= 1 && value <= 36000) after = (unsigned)value;
+  }
+  if (attempted || path == NULL || *path == '\0' || ++frames < after) return;
+  attempted = true;
+  CommunityCaptureWrite(std::filesystem::u8path(path));
 #endif
 }
 

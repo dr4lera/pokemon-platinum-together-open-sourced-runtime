@@ -68,4 +68,29 @@ static inline unsigned SIM_CommunityController_Frame(SIM_CommunityControllerStat
     if (--state->remaining == 0) state->mask = 0;
     return mask;
 }
+/* Capture requests are separate records, never button commands. */
+static inline int SIM_CommunityCapture_Parse(const char *bytes, size_t length, unsigned *out)
+{
+    size_t p = 0;
+    unsigned id;
+    if (!bytes || !out || length < 2 || length > 16
+        || !SIM_CommunityController_Number(bytes, length, &p, 10, 2147483647u, 10, &id)
+        || !id || p + 1 != length || bytes[p] != '\n') return 0;
+    *out = id;
+    return 1;
+}
+static inline int SIM_CommunityCapture_Read(FILE *file, unsigned *out)
+{
+    char bytes[17];
+    size_t length;
+    if (!file || !out) return 0;
+    length = fread(bytes, 1, sizeof(bytes), file);
+    return !ferror(file) && length <= 16 && SIM_CommunityCapture_Parse(bytes, length, out);
+}
+static inline int SIM_CommunityCapture_Accept(unsigned *lastId, unsigned id)
+{
+    if (!lastId || !id || id > 2147483647u || id <= *lastId) return 0;
+    *lastId = id;
+    return 1;
+}
 #endif
