@@ -378,12 +378,14 @@ void *SIM_RenderInit(void *arg) {
                   std::string(makerCode) + "]";
   }
 
+  const char *hiddenSetting = getenv("PLATINUM_COMMUNITY_QA_HIDDEN");
+  const bool privateHidden = hiddenSetting && strcmp(hiddenSetting, "1") == 0;
   window = SDL_CreateWindow(
       windowTitle.c_str(), 100, 100, windowWidth, windowHeight,
-      SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+      (privateHidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN) | SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
   context = SDL_GL_CreateContext(window);
 
-  if(s_SIM_config.fullScreen) {
+  if(s_SIM_config.fullScreen && !privateHidden) {
     SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
   }
 

@@ -28,6 +28,9 @@ file containing at most 1024 ordered `decimal-frame hex-button-mask` records.
 Frames are bounded to 36000, masks to the twelve emulated buttons, and the final
 mask must release all buttons. This opt-in fixture drives only emulated inputs
 inside this process; it never focuses a window or injects OS keyboard/mouse input.
+`PLATINUM_COMMUNITY_QA_HIDDEN=1` creates the SDL window hidden and suppresses
+fullscreen activation, allowing these explicit fixtures to run under a debugger
+without taking desktop focus.
 
 ![logo](images/libntr.png)
 Drop-in replacement for NitroSDK that targets Nintendo DS/DSi, PC, and other platforms.
