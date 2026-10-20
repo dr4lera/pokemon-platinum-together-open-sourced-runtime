@@ -4,6 +4,10 @@ libfs_srcs = files(
     'fs_overlay.c'
 )
 
+if sdk_version_major == 4 and (build_target == 'win64' or build_target == 'linux')
+    libfs_srcs += files('community_asset_overlay.c')
+endif
+
 if(sdk_version_major == 4)
     libfs_srcs += files(
         'fs_command.c',

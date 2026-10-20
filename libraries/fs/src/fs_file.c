@@ -20,6 +20,7 @@
 #include <string.h>
 #include <SDL2/SDL.h>
 #include <simulator/sim_RomExtractor.h>
+#include "../include/community_asset_overlay.h"
 #endif
 
 #if SDK_VERSION_MAJOR == 5
@@ -504,30 +505,25 @@ BOOL FS_OpenFile (FSFile *p_file, const char *path)
 	#endif
 	FSFileID id;
 	#ifdef SDK_PORT
-	if(path[0] == 'r'
-		&& path[1] == 'o'
-	&& path[2] == 'm'
-	&& path[3] == ':'
-	&& strlen(path) > 4) {
-		path = path+4;
-	}
-	if( path[0] == '/')
-	{
-		path = path + 1;
-	}
+	#if SDK_VERSION_MAJOR == 4 && (defined(SDK_BUILD_WIN64) || defined(SDK_BUILD_LINUX))
+	char normalizedPath[COMMUNITY_ASSET_PATH_LIMIT];
 	p_file->pcFilePtr = NULL;
+	if (!CommunityAsset_Normalize(path, normalizedPath, sizeof(normalizedPath))) {
+		return FALSE;
+	}
+	p_file->pcFilePtr = CommunityAsset_Open(path, getenv(COMMUNITY_ASSET_ROOT_ENV));
+	#else
+	if (strncmp(path, "rom:", 4) == 0 && strlen(path) > 4) path += 4;
+	if (path[0] == '/') path++;
 	p_file->pcFilePtr = fopen(path, "rb");
-	if(p_file->pcFilePtr == NULL) {
-		// Try opening with lowercase path
-		char * lowercasePath = malloc(sizeof(char) * strlen(path) + 1);
-		memset(lowercasePath, 0, sizeof(char) * strlen(path) + 1);
+	if (p_file->pcFilePtr == NULL) {
+		char *lowercasePath = malloc(strlen(path) + 1);
 		strcpy(lowercasePath, path);
-		for(int i=0; i < strlen(path); i++) {
-			lowercasePath[i] = tolower(path[i]);
-		}
+		for (int i = 0; path[i]; i++) lowercasePath[i] = tolower(path[i]);
 		p_file->pcFilePtr = fopen(lowercasePath, "rb");
 		free(lowercasePath);
 	}
+	#endif
 	if( p_file->pcFilePtr != NULL )
 	{
 		p_file->stat |= FS_FILE_STATUS_IS_FILE;

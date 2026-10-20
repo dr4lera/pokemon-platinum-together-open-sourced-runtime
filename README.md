@@ -1,4 +1,16 @@
 # libntr
+
+This is the separately maintained [community gameplay runtime](https://github.com/dr4lera/pokemon-platinum-together-open-sourced-client)
+fork, based on cybervisi0n/libntr commit
+`1555d911ac80c0190ac1c321f99f1323de8b3c09`. Original upstream notices remain intact.
+Community changes were developed with OpenAI Codex assistance and are not submitted
+upstream. The desktop SDK4 resource opener adds an explicitly selected private
+asset root and a restricted patch overlay; no game assets are included.
+
+The gameplay client's `tests/run_community_asset_overlay.py` checks the actual
+resolver and FS opener, including patch preference, fallback, malformed paths
+and symlink confinement. These checks do not establish full gameplay parity.
+
 ![logo](images/libntr.png)
 Drop-in replacement for NitroSDK that targets Nintendo DS/DSi, PC, and other platforms.
 
