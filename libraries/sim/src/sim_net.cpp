@@ -7,6 +7,7 @@
 #include <simulator/sim_net_validation.h>
 #include <cstddef>
 #include <atomic>
+#include <mutex>
 
 extern "C" void WMSP_Wait4Wm9(void);
 
@@ -52,10 +53,28 @@ enum {
 
 static SIM_Net_t net = {};
 static std::atomic<const SIM_Net_Provider_t*> applicationProvider{nullptr};
+static std::mutex parentInfoMutex;
+static SIM_Net_ParentInfo_t parentInfo{};
+static SIM_Net_ParentInfo_t ParentInfoCopy()
+{
+    std::lock_guard<std::mutex> lock(parentInfoMutex);
+    return parentInfo;
+}
+
+void SIM_Net_SetParentInfo(const SIM_Net_ParentInfo_t *info)
+{
+    std::lock_guard<std::mutex> lock(parentInfoMutex);
+    parentInfo = info ? *info : SIM_Net_ParentInfo_t{};
+}
+
+BOOL SIM_Net_HasProvider(void)
+{
+    return applicationProvider.load(std::memory_order_acquire) ? TRUE : FALSE;
+}
 
 BOOL SIM_Net_InstallProvider(const SIM_Net_Provider_t *provider)
 {
-    if (!provider || provider->version != 1 || !provider->process || !provider->beacon
+    if (!provider || provider->version != 2 || !provider->process || !provider->beacon
         || !provider->startHost || !provider->startClient || !provider->getAid
         || !provider->getPlayerId || !provider->getState || !provider->getPlayerCount
         || !provider->getPlayers || !provider->setGameInfo || !provider->setMPState
@@ -66,8 +85,9 @@ BOOL SIM_Net_InstallProvider(const SIM_Net_Provider_t *provider)
     if (net.state != SIM_NET_STATE_DISCONNECTED || net.enetHost != nullptr) return FALSE;
     /* WM can advertise before a transport is selected. Preserve its current
      * metadata/role when an application explicitly selects this provider. */
+    const auto info = ParentInfoCopy();
     provider->setGameInfo(provider->context, net.curPlayer.ggid, net.curPlayer.tgid,
-        net.curPlayer.userGameInfo, net.curPlayer.userGameInfoLength);
+        net.curPlayer.userGameInfo, net.curPlayer.userGameInfoLength, &info);
     provider->setMPState(provider->context, net.curPlayer.mpState);
     return applicationProvider.compare_exchange_strong(expected, provider,
         std::memory_order_release, std::memory_order_acquire) ? TRUE : FALSE;
@@ -308,7 +328,7 @@ const SIM_Net_Player_t * SIM_Net_GetPlayerList()
 
 void SIM_Net_SetGameInfo(int ggid, int tgid, u8 * userGameInfo, int userGameInfoLength)
 {
-    if (auto *p = applicationProvider.load(std::memory_order_acquire)) { p->setGameInfo(p->context, ggid, tgid, userGameInfo, userGameInfoLength); return; }
+    if (auto *p = applicationProvider.load(std::memory_order_acquire)) { const auto info=ParentInfoCopy();p->setGameInfo(p->context, ggid, tgid, userGameInfo, userGameInfoLength, &info); return; }
     if(userGameInfoLength < 0) return;
     net.curPlayer.ggid = ggid;
     net.curPlayer.tgid = tgid;
@@ -490,15 +510,21 @@ BOOL SIM_Net_SendMPData(u16 aidBitmap, u8 port, u8 * data, int dataLen)
 int SIM_Net_Scan(WMBssDesc * bssDescOut)
 {
     if (auto *p = applicationProvider.load(std::memory_order_acquire)) return p->scan(p->context, bssDescOut);
+    if (!bssDescOut) return 0;
     int numParentsFound = 0;
 
     for(int i=0; i < SIM_NET_MAX_PLAYERS; i++) {
         if(net.playerList[i].status == SIM_NET_PLAYERSTATUS_CLIENT || net.playerList[i].status == SIM_NET_PLAYERSTATUS_HOST) {
             if(net.playerList[i].mpState == SIM_NET_MPSTATE_PARENT) {
-                // Found a parent
+                // Preserve the legacy ENet wire layout; its extra parent
+                // transport parameters remain unavailable on this old path.
+                memset(&bssDescOut[numParentsFound], 0, sizeof(WMBssDesc));
+                bssDescOut[numParentsFound].length = sizeof(WMBssDesc) / sizeof(u16);
                 memcpy(bssDescOut[numParentsFound].bssid, net.playerList[i].ndsMacAddr, 6);
                 bssDescOut[numParentsFound].gameInfo.magicNumber = WM_GAMEINFO_MAGIC_NUMBER;
-                bssDescOut[numParentsFound].gameInfoLength = WM_GAMEINFO_LENGTH_MIN;
+                bssDescOut[numParentsFound].gameInfoLength = WM_GAMEINFO_LENGTH_MIN + net.playerList[i].userGameInfoLength;
+                bssDescOut[numParentsFound].gameInfo.ver = WM_GAMEINFO_VERSION_NUMBER;
+                bssDescOut[numParentsFound].gameInfo.platform = WM_GAMEINFO_PLATFORM_ID_NITRO;
                 bssDescOut[numParentsFound].gameInfo.gameNameCount_attribute = WM_ATTR_FLAG_ENTRY;
                 bssDescOut[numParentsFound].gameInfo.ggid = net.playerList[i].ggid;
                 bssDescOut[numParentsFound].gameInfo.tgid = net.playerList[i].tgid;

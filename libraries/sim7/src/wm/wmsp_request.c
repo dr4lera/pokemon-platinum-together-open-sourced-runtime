@@ -294,6 +294,24 @@ void WMSP_PowerOff(OSMessage msg)
     return;
 }
 
+static void WmspSimPublishParentInfo(WMStatus *status)
+{
+    const WMParentParam *param = &status->pparam;
+    SIM_Net_ParentInfo_t info;
+    MI_CpuClear8(&info, sizeof(info));
+    info.parentMaxSize = param->parentMaxSize;
+    info.childMaxSize = param->childMaxSize;
+    info.beaconPeriod = param->beaconPeriod;
+    info.channel = param->channel;
+    info.maxEntry = param->maxEntry;
+    info.attributes = (u8)((param->entryFlag ? WM_ATTR_FLAG_ENTRY : 0)
+        | (param->multiBootFlag ? WM_ATTR_FLAG_MB : 0)
+        | (param->KS_Flag ? WM_ATTR_FLAG_KS : 0)
+        | (param->CS_Flag ? WM_ATTR_FLAG_CS : 0));
+    SIM_Net_SetParentInfo(&info);
+    SIM_Net_SetGameInfo(param->ggid, param->tgid, (u8 *)param->userGameInfo, param->userGameInfoLength);
+}
+
 void WMSP_SetParentParam(OSMessage msg)
 {
     #ifdef SDK_BUILD_ARM
@@ -310,7 +328,7 @@ void WMSP_SetParentParam(OSMessage msg)
 
     MI_CpuCopy8((void *)param, (void *)&(status->pparam), WM_PARENT_PARAM_SIZE);
 
-    SIM_Net_SetGameInfo(param->ggid, param->tgid, (u8*)param->userGameInfo, param->userGameInfoLength);
+    WmspSimPublishParentInfo(status);
 
     cb = (WMCallback *)WMSP_GetBuffer4Callback2Wm9();
     cb->apiid = WM_APIID_SET_P_PARAM;
@@ -339,6 +357,19 @@ void WMSP_StartParent(OSMessage msg)
         return;
     }
 
+    if (status->pparam.userGameInfoLength > WM_SIZE_USER_GAMEINFO
+        || (status->pparam.userGameInfoLength && !status->pparam.userGameInfo)
+        || status->pparam.maxEntry > WM_NUM_MAX_CHILD
+        || status->pparam.parentMaxSize + (status->pparam.KS_Flag ? WM_SIZE_KS_PARENT_DATA + WM_SIZE_MP_PARENT_PADDING : 0) > WM_SIZE_MP_DATA_MAX
+        || status->pparam.childMaxSize + (status->pparam.KS_Flag ? WM_SIZE_KS_CHILD_DATA + WM_SIZE_MP_CHILD_PADDING : 0) > WM_SIZE_MP_DATA_MAX) {
+        cb = (WMStartParentCallback *)WMSP_GetBuffer4Callback2Wm9();
+        MI_CpuClear8(cb, sizeof(*cb));
+        cb->apiid = WM_APIID_START_PARENT;
+        cb->errcode = WM_ERRCODE_INVALID_PARAM;
+        cb->state = WM_STATECODE_PARENT_START;
+        WMSP_ReturnResult2Wm9(cb);
+        return;
+    }
     status->mode = WL_CMDLABEL_MODE_PARENT;
     status->aid = 0;
     {
@@ -349,11 +380,17 @@ void WMSP_StartParent(OSMessage msg)
         (void)OS_RestoreInterrupts(e);
     }
 
+    WMSP_SetParentMaxSize((u16)(status->pparam.parentMaxSize
+        + (status->pparam.KS_Flag ? WM_SIZE_KS_PARENT_DATA + WM_SIZE_MP_PARENT_PADDING : 0)));
+    WMSP_SetChildMaxSize((u16)(status->pparam.childMaxSize
+        + (status->pparam.KS_Flag ? WM_SIZE_KS_CHILD_DATA + WM_SIZE_MP_CHILD_PADDING : 0)));
+    WmspSimPublishParentInfo(status);
     #ifndef SDK_BUILD_ARM
     SIM_Net_SetMPState(SIM_NET_MPSTATE_PARENT);
     #endif
 
     cb = (WMStartParentCallback *)WMSP_GetBuffer4Callback2Wm9();
+    MI_CpuClear8(cb, sizeof(*cb));
 
     ChangeWmState(status, WM_STATE_PARENT);
     cb->apiid = WM_APIID_START_PARENT;
@@ -384,6 +421,8 @@ void WMSP_EndParent(OSMessage msg)
         return;
     }
 
+    status->beaconIndicateFlag = 0;
+    SIM_Net_SetMPState(SIM_NET_MPSTATE_OFF);
     ChangeWmState(status, WM_STATE_IDLE);
     
 
@@ -400,72 +439,92 @@ void WMSP_EndParent(OSMessage msg)
     WMSP_ReturnResult2Wm9((void *)cb);
 }
 
+/* The simulated transport returns a bounded array. Ordinary WM_StartScan has
+ * room for exactly one descriptor, so never let it write into the caller's
+ * single WMBssDesc. Requests run on the serialized WMSP request thread. */
+static WMBssDesc WmspSimScanParents[SIM_NET_MAX_PLAYERS];
+static unsigned WmspSimScanCursor;
+
+static BOOL WmspSimBssidMatches(const u8 *requested, const u8 *actual)
+{
+    u8 address[WM_SIZE_MACADDR];
+    BOOL wildcard = TRUE;
+    unsigned i;
+    MI_CpuCopy8(requested, address, sizeof(address));
+    for (i = 0; i < sizeof(address); ++i) if (address[i] != 0xff) wildcard = FALSE;
+    if (wildcard) return TRUE;
+    if (address[0] != 0xff || address[1] != 0xff) address[0] &= 0xfe;
+    return memcmp(address, actual, sizeof(address)) == 0;
+}
+
+static BOOL WmspSimValidScanDesc(const WMBssDesc *desc)
+{
+    return desc->ssidLength <= WM_SIZE_SSID
+        && desc->gameInfoLength <= sizeof(WMGameInfo)
+        && desc->gameInfo.userGameInfoLength <= WM_SIZE_USER_GAMEINFO
+        && (desc->gameInfoLength == 0 ||
+            (desc->gameInfoLength >= WM_GAMEINFO_LENGTH_MIN
+             && desc->gameInfoLength >= WM_GAMEINFO_LENGTH_MIN + desc->gameInfo.userGameInfoLength));
+}
+
 void WMSP_StartScan(OSMessage msg)
 {
-    WMSPWork *const work = WMSP_GetSystemWork();
     WMStatus *status = WMSP_GetStatusStructure();
-
-    u16     current_state;
-    u16     scanChannel;
-    u16     scanBssid[3];
-    u16     scanMaxChannelTime;
-
     WMStartScanReq *args = (WMStartScanReq *)msg;
-
-    if (status->state != WM_STATE_IDLE && status->state != WM_STATE_CLASS1 &&
-        status->state != WM_STATE_SCAN)
-    {
-        WMStartScanCallback *callback = (WMStartScanCallback *)WMSP_GetBuffer4Callback2Wm9();
-        callback->apiid = WM_APIID_START_SCAN;
+    WMStartScanCallback *callback = (WMStartScanCallback *)WMSP_GetBuffer4Callback2Wm9();
+    int count, selected = -1;
+    unsigned step;
+    MI_CpuClear8(callback, sizeof(*callback));
+    callback->apiid = WM_APIID_START_SCAN;
+    callback->state = WM_STATECODE_PARENT_NOT_FOUND;
+    callback->channel = args->channel;
+    callback->linkLevel = WM_LINK_LEVEL_0;
+    if (status->state != WM_STATE_IDLE && status->state != WM_STATE_CLASS1 && status->state != WM_STATE_SCAN) {
         callback->errcode = WM_ERRCODE_ILLEGAL_STATE;
-        callback->state = WM_STATECODE_PARENT_NOT_FOUND;
         WMSP_ReturnResult2Wm9(callback);
         return;
     }
-
+    if (!args->scanBuf || args->channel < 1 || args->channel > 14) {
+        callback->errcode = WM_ERRCODE_INVALID_PARAM;
+        WMSP_ReturnResult2Wm9(callback);
+        return;
+    }
     status->pInfoBuf = args->scanBuf;
-    status->scan_channel = scanChannel = args->channel;
-    scanMaxChannelTime = args->maxChannelTime;
-    MI_CpuCopy8(args->bssid, scanBssid, WM_SIZE_MACADDR);
-
-    if ((scanBssid[0] != 0xffff) && (scanBssid[0] & 0x0001))
-    {
-        OS_Printf("[ARM7] WM_StartScan: assigned Bssid is MulticastAddress. LSB is cleared.\n");
-        scanBssid[0] &= ~(0x0001);
-    }
-
+    status->scan_channel = args->channel;
     status->mode = WL_CMDLABEL_MODE_CHILD;
-
     ChangeWmState(status, WM_STATE_SCAN);
-
-    WMStartScanCallback *callback = (WMStartScanCallback *)WMSP_GetBuffer4Callback2Wm9();
-
-    WMBssDesc * dest = status->pInfoBuf;
-
-    int parentsFound = SIM_Net_Scan(dest);
-
+    MI_CpuClear8(WmspSimScanParents, sizeof(WmspSimScanParents));
+    count = SIM_Net_Scan(WmspSimScanParents);
     SDL_Delay(1);
-
-    if(parentsFound == 0) {
-        callback->apiid = WM_APIID_START_SCAN;
-        callback->errcode = WM_ERRCODE_SUCCESS;
-        callback->state = WM_STATECODE_PARENT_NOT_FOUND;
-        callback->channel = scanChannel;
-        callback->linkLevel = WM_LINK_LEVEL_0;
-
-        WMSP_ReturnResult2Wm9((void *)callback);
-    } else {
-        callback->apiid = WM_APIID_START_SCAN;
-        callback->errcode = WM_ERRCODE_SUCCESS;
-        callback->state = WM_STATECODE_PARENT_FOUND;
-
-        callback->gameInfoLength = dest[0].gameInfoLength;
-        callback->gameInfo.ggid = dest[0].gameInfo.ggid;
-        callback->gameInfo.tgid = dest[0].gameInfo.tgid;
-        callback->gameInfo.gameNameCount_attribute = dest[0].gameInfo.gameNameCount_attribute;
-
-        WMSP_ReturnResult2Wm9((void *)callback);
+    if (count < 0 || count > SIM_NET_MAX_PLAYERS) {
+        callback->errcode = WM_ERRCODE_FAILED;
+        WMSP_ReturnResult2Wm9(callback);
+        return;
     }
+    for (step = 0; step < (unsigned)count; ++step) {
+        unsigned index = (WmspSimScanCursor + step) % (unsigned)count;
+        WMBssDesc *desc = &WmspSimScanParents[index];
+        if (WmspSimValidScanDesc(desc) && WmspSimBssidMatches(args->bssid, desc->bssid)
+            && (desc->channel == 0 || desc->channel == args->channel)) {
+            selected = (int)index;
+            WmspSimScanCursor = index + 1;
+            break;
+        }
+    }
+    callback->errcode = WM_ERRCODE_SUCCESS;
+    if (selected >= 0) {
+        const WMBssDesc *desc = &WmspSimScanParents[selected];
+        MI_CpuCopy8(desc, args->scanBuf, sizeof(*desc));
+        callback->state = WM_STATECODE_PARENT_FOUND;
+        callback->channel = desc->channel ? desc->channel : args->channel;
+        callback->linkLevel = WM_LINK_LEVEL_3;
+        callback->ssidLength = desc->ssidLength;
+        MI_CpuCopy8(desc->bssid, callback->macAddress, WM_SIZE_MACADDR);
+        MI_CpuCopy8(desc->ssid, callback->ssid, WM_SIZE_SSID);
+        callback->gameInfoLength = desc->gameInfoLength;
+        MI_CpuCopy8(&desc->gameInfo, &callback->gameInfo, desc->gameInfoLength);
+    }
+    WMSP_ReturnResult2Wm9(callback);
 }
 
 void WMSP_EndScan(OSMessage msg)
@@ -505,6 +564,7 @@ void WMSP_StartConnectEx(OSMessage msg)
     if (status->state != WM_STATE_IDLE)
     {
         WMStartConnectCallback *callback = (WMStartConnectCallback *)WMSP_GetBuffer4Callback2Wm9();
+        MI_CpuClear8(callback, sizeof(*callback));
         callback->apiid = WM_APIID_START_CONNECT;
         callback->errcode = WM_ERRCODE_ILLEGAL_STATE;
         callback->state = WM_STATECODE_CONNECT_START;
@@ -512,6 +572,20 @@ void WMSP_StartConnectEx(OSMessage msg)
         return;
     }
 
+    if (!args->pInfo || args->pInfo->gameInfoLength > sizeof(WMGameInfo)
+        || args->pInfo->gameInfo.userGameInfoLength > WM_SIZE_USER_GAMEINFO
+        || (args->pInfo->gameInfoLength >= WM_GAMEINFO_LENGTH_MIN
+            && (args->pInfo->gameInfoLength < WM_GAMEINFO_LENGTH_MIN + args->pInfo->gameInfo.userGameInfoLength
+                || args->pInfo->gameInfo.parentMaxSize + ((args->pInfo->gameInfo.attribute & WM_ATTR_FLAG_KS) ? WM_SIZE_KS_PARENT_DATA + WM_SIZE_MP_PARENT_PADDING : 0) > WM_SIZE_MP_DATA_MAX
+                || args->pInfo->gameInfo.childMaxSize + ((args->pInfo->gameInfo.attribute & WM_ATTR_FLAG_KS) ? WM_SIZE_KS_CHILD_DATA + WM_SIZE_MP_CHILD_PADDING : 0) > WM_SIZE_MP_DATA_MAX))) {
+        WMStartConnectCallback *callback = (WMStartConnectCallback *)WMSP_GetBuffer4Callback2Wm9();
+        MI_CpuClear8(callback, sizeof(*callback));
+        callback->apiid = WM_APIID_START_CONNECT;
+        callback->errcode = WM_ERRCODE_INVALID_PARAM;
+        callback->state = WM_STATECODE_CONNECT_START;
+        WMSP_ReturnResult2Wm9(callback);
+        return;
+    }
     MI_CpuCopy8((void *)(args->pInfo), &(p->connectPInfo), WM_BSS_DESC_SIZE);
 
     {
@@ -524,6 +598,7 @@ void WMSP_StartConnectEx(OSMessage msg)
 
                 WMStartConnectCallback *cb =
                     (WMStartConnectCallback *)WMSP_GetBuffer4Callback2Wm9();
+                MI_CpuClear8(cb, sizeof(*cb));
                 cb->apiid = WM_APIID_START_CONNECT;
                 cb->errcode = WM_ERRCODE_NO_ENTRY;
                 cb->state = WM_STATECODE_CONNECT_START;
@@ -535,6 +610,7 @@ void WMSP_StartConnectEx(OSMessage msg)
 
     {
         WMStartConnectCallback *callback = (WMStartConnectCallback *)WMSP_GetBuffer4Callback2Wm9();
+        MI_CpuClear8(callback, sizeof(*callback));
         callback->apiid = WM_APIID_START_CONNECT;
         callback->errcode = WM_ERRCODE_SUCCESS;
         callback->state = WM_STATECODE_CONNECT_START;
@@ -545,6 +621,7 @@ void WMSP_StartConnectEx(OSMessage msg)
     {
         WMStartConnectCallback *callback =
             (WMStartConnectCallback *)WMSP_GetBuffer4Callback2Wm9();
+        MI_CpuClear8(callback, sizeof(*callback));
         callback->apiid = WM_APIID_START_CONNECT;
         callback->errcode = WM_ERRCODE_FAILED;
         callback->state = WM_STATECODE_DISCONNECTED;
@@ -554,6 +631,22 @@ void WMSP_StartConnectEx(OSMessage msg)
     }
 
     status->aid = SIM_Net_GetAID();
+    if (status->aid == 0 || status->aid > WM_NUM_MAX_CHILD) {
+        WMStartConnectCallback *callback = (WMStartConnectCallback *)WMSP_GetBuffer4Callback2Wm9();
+        MI_CpuClear8(callback, sizeof(*callback));
+        callback->apiid = WM_APIID_START_CONNECT;
+        callback->errcode = WM_ERRCODE_FAILED;
+        callback->state = WM_STATECODE_DISCONNECTED;
+        WMSP_ReturnResult2Wm9(callback);
+        return;
+    }
+    status->mode = WL_CMDLABEL_MODE_CHILD;
+    status->curr_tgid = p->connectPInfo.gameInfo.tgid;
+    MI_CpuCopy8(p->connectPInfo.bssid, status->parentMacAddress, WM_SIZE_MACADDR);
+    WMSP_SetParentMaxSize((u16)(p->connectPInfo.gameInfo.parentMaxSize
+        + ((p->connectPInfo.gameInfo.attribute & WM_ATTR_FLAG_KS) ? WM_SIZE_KS_PARENT_DATA + WM_SIZE_MP_PARENT_PADDING : 0)));
+    WMSP_SetChildMaxSize((u16)(p->connectPInfo.gameInfo.childMaxSize
+        + ((p->connectPInfo.gameInfo.attribute & WM_ATTR_FLAG_KS) ? WM_SIZE_KS_CHILD_DATA + WM_SIZE_MP_CHILD_PADDING : 0)));
     status->child_bitmap = 0x0001;
     status->mp_readyBitmap = 0x0001;
 
@@ -565,6 +658,7 @@ void WMSP_StartConnectEx(OSMessage msg)
     {
         WMStartConnectCallback *callback =
             (WMStartConnectCallback *)WMSP_GetBuffer4Callback2Wm9();
+        MI_CpuClear8(callback, sizeof(*callback));
         callback->apiid = WM_APIID_START_CONNECT;
         callback->errcode = WM_ERRCODE_SUCCESS;
         callback->state = WM_STATECODE_CONNECTED;
@@ -771,7 +865,7 @@ void WMSP_EndMP(OSMessage msg)
     status->mp_setDataFlag = FALSE;
     status->mp_flag = FALSE;
 
-    SIM_Net_SetMPState(SIM_NET_MPSTATE_OFF);
+    SIM_Net_SetMPState(status->state == WM_STATE_PARENT ? SIM_NET_MPSTATE_PARENT : SIM_NET_MPSTATE_CHILD);
 
     {
         WMCallback *cb = (WMCallback *)WMSP_GetBuffer4Callback2Wm9();
@@ -805,7 +899,7 @@ void WMSP_SetGameInfo(OSMessage msg)
     status->pparam.KS_Flag = (u16)((attribute & WM_ATTR_FLAG_KS) ? 1 : 0);
     status->pparam.CS_Flag = (u16)((attribute & WM_ATTR_FLAG_CS) ? 1 : 0);
 
-    SIM_Net_SetGameInfo(status->pparam.ggid, status->pparam.tgid, (u8*)status->pparam.userGameInfo, status->pparam.userGameInfoLength);
+    WmspSimPublishParentInfo(status);
 
     {
         WMCallback *cb = (WMCallback *)WMSP_GetBuffer4Callback2Wm9();
@@ -855,42 +949,88 @@ void WMSP_MeasureChannel(OSMessage msg)
     WMSP_ReturnResult2Wm9((void *)cb);
 }
 
+static BOOL WmspSimScanSsidMatches(const WMStartScanExReq *args, const WMBssDesc *desc)
+{
+    unsigned length;
+    if (args->ssidLength == 0) return TRUE;
+    length = args->ssidLength;
+#if WM_SSID_MASK_CUSTOMIZE
+    if (args->scanType == WM_SCANTYPE_ACTIVE_CUSTOM || args->scanType == WM_SCANTYPE_PASSIVE_CUSTOM) {
+        length = args->ssidMatchLength;
+        return desc->ssidLength >= length && memcmp(args->ssid, desc->ssid, length) == 0;
+    }
+#endif
+    return desc->ssidLength == length && memcmp(args->ssid, desc->ssid, length) == 0;
+}
+
 void WMSP_StartScanEx(OSMessage msg)
 {
-    WMSPWork *const work = WMSP_GetSystemWork();
-	WMStatus *status = WMSP_GetStatusStructure();
-    WMStartScanExCallback *callback = (WMStartScanExCallback *)WMSP_GetBuffer4Callback2Wm9();
+    WMStatus *status = WMSP_GetStatusStructure();
     WMStartScanExReq *args = (WMStartScanExReq *)msg;
-
-    status->pInfoBuf = args->scanBuf;
-
-    WMBssDesc * dest = status->pInfoBuf;
-
-    int numParentsFound = SIM_Net_Scan(dest);
-
-    strcpy(dest[numParentsFound].ssid, "SimAP");
-    dest[numParentsFound].ssidLength = strlen("SimAP");
-    numParentsFound++;
-
-    SDL_Delay(1);
-
-    if(numParentsFound == 0) {
- 	    callback->apiid = WM_APIID_START_SCAN_EX;
-	    callback->errcode = WM_ERRCODE_SUCCESS;
-	    callback->state = WM_STATECODE_PARENT_NOT_FOUND;
-	    callback->bssDescCount = 0;
-
-        WMSP_ReturnResult2Wm9((void *)callback);
-    } else {
- 	    callback->apiid = WM_APIID_START_SCAN_EX;
-	    callback->errcode = WM_ERRCODE_SUCCESS;
-	    callback->state = WM_STATECODE_PARENT_FOUND;
-	    callback->bssDescCount = numParentsFound;
-        callback->bssDesc[0] = &dest[0];
-
-        ChangeWmState(status, WM_STATE_SCAN);
-
-        WMSP_ReturnResult2Wm9((void *)callback);
+    WMStartScanExCallback *callback = (WMStartScanExCallback *)WMSP_GetBuffer4Callback2Wm9();
+    unsigned count = 0, capacity, i;
+    int found;
+    MI_CpuClear8(callback, sizeof(*callback));
+    callback->apiid = WM_APIID_START_SCAN_EX;
+    callback->state = WM_STATECODE_PARENT_NOT_FOUND;
+    callback->channelList = args->channelList & 0x3fff;
+    if (status->state != WM_STATE_IDLE && status->state != WM_STATE_CLASS1 && status->state != WM_STATE_SCAN) {
+        callback->errcode = WM_ERRCODE_ILLEGAL_STATE;
+        WMSP_ReturnResult2Wm9(callback);
+        return;
     }
+    if (!args->scanBuf || args->scanBufSize < sizeof(WMBssDesc) || args->scanBufSize > WM_SIZE_SCAN_EX_BUF
+        || !(args->channelList & 0x3fff) || ((u64)args->scanBuf & 3U)
+        || args->ssidLength > WM_SIZE_SSID || args->scanType > WM_SCANTYPE_PASSIVE_CUSTOM
+#if WM_SSID_MASK_CUSTOMIZE
+        || args->ssidMatchLength > WM_SIZE_SSID
+#endif
+        ) {
+        callback->errcode = WM_ERRCODE_INVALID_PARAM;
+        WMSP_ReturnResult2Wm9(callback);
+        return;
+    }
+    capacity = args->scanBufSize / sizeof(WMBssDesc);
+    if (capacity > WM_SCAN_EX_PARENT_MAX) capacity = WM_SCAN_EX_PARENT_MAX;
+    status->pInfoBuf = args->scanBuf;
+    status->scan_channel = args->channelList;
+    status->mode = WL_CMDLABEL_MODE_CHILD;
+    ChangeWmState(status, WM_STATE_SCAN);
+    MI_CpuClear8(WmspSimScanParents, sizeof(WmspSimScanParents));
+    found = SIM_Net_Scan(WmspSimScanParents);
+    SDL_Delay(1);
+    if (found < 0 || found > SIM_NET_MAX_PLAYERS) {
+        callback->errcode = WM_ERRCODE_FAILED;
+        WMSP_ReturnResult2Wm9(callback);
+        return;
+    }
+    for (i = 0; i < (unsigned)found && count < capacity; ++i) {
+        WMBssDesc *desc = &WmspSimScanParents[i];
+        if (!WmspSimValidScanDesc(desc) || !WmspSimBssidMatches(args->bssid, desc->bssid)
+            || !WmspSimScanSsidMatches(args, desc)
+            || (desc->channel != 0 && (desc->channel > 14 || !(args->channelList & (1U << (desc->channel - 1)))))) continue;
+        MI_CpuCopy8(desc, &args->scanBuf[count], sizeof(*desc));
+        callback->bssDesc[count] = &args->scanBuf[count];
+        callback->linkLevel[count] = WM_LINK_LEVEL_3;
+        ++count;
+    }
+    /* SimAP is only the legacy ENet simulator's synthetic access point. An
+     * explicitly selected authenticated provider must never discover it. */
+    if (!SIM_Net_HasProvider() && count < capacity) {
+        WMBssDesc ap;
+        MI_CpuClear8(&ap, sizeof(ap));
+        ap.length = sizeof(ap) / sizeof(u16);
+        ap.ssidLength = 5;
+        MI_CpuCopy8("SimAP", ap.ssid, 5);
+        if (WmspSimBssidMatches(args->bssid, ap.bssid) && WmspSimScanSsidMatches(args, &ap)) {
+            MI_CpuCopy8(&ap, &args->scanBuf[count], sizeof(ap));
+            callback->bssDesc[count] = &args->scanBuf[count];
+            callback->linkLevel[count++] = WM_LINK_LEVEL_3;
+        }
+    }
+    callback->errcode = WM_ERRCODE_SUCCESS;
+    callback->bssDescCount = (u16)count;
+    if (count) callback->state = WM_STATECODE_PARENT_FOUND;
+    WMSP_ReturnResult2Wm9(callback);
 }
 

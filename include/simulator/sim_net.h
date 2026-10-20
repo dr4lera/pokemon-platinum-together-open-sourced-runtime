@@ -151,7 +151,16 @@ typedef struct {
  * and must precede any ENet connection; callbacks may run on the net/ARM7/game
  * threads and must synchronize their own state. process() owns RX lifetimes. */
 typedef struct {
-    unsigned version; /* Must be 1. */
+    u16 parentMaxSize;
+    u16 childMaxSize;
+    u16 beaconPeriod;
+    u16 channel;
+    u16 maxEntry;
+    u8 attributes;
+} SIM_Net_ParentInfo_t;
+
+typedef struct {
+    unsigned version; /* Must be 2. */
     void *context;
     void (*process)(void *);
     void (*beacon)(void *);
@@ -162,7 +171,8 @@ typedef struct {
     SIM_Net_State_t (*getState)(void *);
     int (*getPlayerCount)(void *);
     const SIM_Net_Player_t *(*getPlayers)(void *);
-    void (*setGameInfo)(void *, int, int, const u8 *, int);
+    /* Metadata pointer is borrowed only for this call; implementations copy it. */
+    void (*setGameInfo)(void *, int, int, const u8 *, int, const SIM_Net_ParentInfo_t *);
     void (*setMPState)(void *, SIM_Net_MPState_t);
     BOOL (*join)(void *, const u8 *, const u8 *);
     BOOL (*disconnect)(void *, u16, u16 *);
@@ -176,6 +186,7 @@ extern "C" {
 
 void SIM_Net_Init();
 BOOL SIM_Net_InstallProvider(const SIM_Net_Provider_t *provider);
+BOOL SIM_Net_HasProvider(void);
 void SIM_Net_Process();
 void SIM_Net_SendBeaconIndication();
 void SIM_Net_StartThread();
@@ -190,6 +201,7 @@ int SIM_Net_GetPlayerCount();
 const SIM_Net_Player_t * SIM_Net_GetPlayerList();
 
 void SIM_Net_SetGameInfo(int ggid, int tgid, u8 * userGameInfo, int userGameInfoLength);
+void SIM_Net_SetParentInfo(const SIM_Net_ParentInfo_t *info);
 void SIM_Net_SetMPState(SIM_Net_MPState_t state);
 
 BOOL SIM_Net_JoinMP(u8 * bssid, u8 * ssid);
